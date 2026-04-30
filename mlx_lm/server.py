@@ -43,6 +43,7 @@ from .models.cache import (
     make_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
+from .structured import StructuredProcessorCache
 from .utils import _parse_size, load, sharded_load
 
 
@@ -203,6 +204,7 @@ class CompletionRequest:
     messages: List[Any]
     tools: Optional[List[Any]]
     role_mapping: Optional[Dict[str, Any]]
+    json_schema: Optional[Any]
 
 
 @dataclass
@@ -447,6 +449,8 @@ class ResponseGenerator:
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
+        self.processor_cache = StructuredProcessorCache()
+
         self._stop = False
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
@@ -773,13 +777,20 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
+                    proc = self.processor_cache._make_structured_processor(
+                        request.json_schema, current_tokenizer
+                    )
+                    base_logits_processors = _make_logits_processors(args)
+                    if proc is not None:
+                        base_logits_processors = [*base_logits_processors, proc]
+
                     (uid,) = batch_generator.insert_segments(
                         segments=[segments],
                         max_tokens=[args.max_tokens],
                         caches=[cache],
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, tokenizer)],
-                        logits_processors=[_make_logits_processors(args)],
+                        logits_processors=[base_logits_processors],
                         state_machines=[sm],
                     )
                     batch_results[uid] = {
@@ -966,6 +977,12 @@ class ResponseGenerator:
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
+            # make a structrued one if there is a schema
+            proc = self.processor_cache._make_structured_processor(
+                request.json_schema, tokenizer
+            )
+            if proc is not None:
+                logits_processors = [*logits_processors, proc]
 
             # Load the KV cache
             self._log_cache_stats()
@@ -1062,6 +1079,19 @@ class ResponseGenerator:
     @property
     def cli_args(self):
         return self.model_provider.cli_args
+
+
+def _extract_json_schema(body: Dict[str, Any]) -> Optional[Any]:
+    # This is quite permissive about the different ways
+    # that different packages embed json_schema in requests.
+    schema = body.get("json_schema")
+    if schema is None:
+        response_format = body.get("response_format")
+        if isinstance(response_format, dict):
+            schema = response_format.get("json_schema") or response_format.get("schema")
+            if isinstance(schema, dict) and "schema" in schema:
+                schema = schema.get("schema")
+    return schema
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -1604,6 +1634,7 @@ class APIHandler(BaseHTTPRequestHandler):
             body["messages"],
             body.get("tools") or None,
             body.get("role_mapping"),
+            _extract_json_schema(body),
         )
 
     def handle_text_completions(self) -> CompletionRequest:
@@ -1618,11 +1649,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.object_type = "text_completion"
         assert "prompt" in self.body, "Request did not contain a prompt"
         return CompletionRequest(
-            "text",
-            self.body["prompt"],
-            [],
-            None,
-            None,
+            "text", self.body["prompt"], [], None, None, _extract_json_schema(self.body)
         )
 
     def do_GET(self):
