@@ -58,6 +58,7 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+_CACHE_CLEAR_INTERVAL = 256
 
 
 def str2bool(string):
@@ -482,7 +483,7 @@ def generate_step(
         if n == max_tokens:
             break
         yield y.item(), logprobs
-        if n % 256 == 0:
+        if n % _CACHE_CLEAR_INTERVAL == 0:
             mx.clear_cache()
         y, logprobs = next_y, next_logprobs
         n += 1
@@ -821,6 +822,7 @@ def mtp_generate_step(
         y = _prefill(y, input_embeddings)
 
     ntoks = 0
+    last_cache_block = 0
     draft_tok = draft_lp = None
 
     while ntoks < max_tokens:
@@ -890,6 +892,10 @@ def mtp_generate_step(
                 )
                 mx.eval(draft_tok)
                 y = mx.array([verify_tok_id], mx.uint32)
+        block = ntoks // _CACHE_CLEAR_INTERVAL
+        if block > last_cache_block:
+            mx.clear_cache()
+            last_cache_block = block
 
 
 def stream_generate(
