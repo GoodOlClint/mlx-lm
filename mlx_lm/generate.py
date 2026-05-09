@@ -6,6 +6,7 @@ import copy
 import functools
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -227,6 +228,14 @@ def setup_arg_parser():
         action="store_true",
         help="Use native Multi-Token Prediction for speculative decoding "
         "(requires a model with an MTP head, e.g. Qwen3.5).",
+    )
+    parser.add_argument(
+        "--json-schema",
+        type=str,
+        default=None,
+        help="Constrain generation to JSON conforming to a schema. "
+        "Accepts either a path to a .json file or an inline JSON string. "
+        "Composes with --mtp and --draft-model.",
     )
     return parser
 
@@ -2312,6 +2321,25 @@ def main():
         xtc_threshold=args.xtc_threshold,
         xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
+
+    logits_processors = None
+    if args.json_schema is not None:
+        from .structured import JSONLogitsProcessor
+
+        # Path or inline JSON.
+        if os.path.isfile(args.json_schema):
+            with open(args.json_schema, "r") as f:
+                schema = json.load(f)
+        else:
+            try:
+                schema = json.loads(args.json_schema)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"--json-schema must be a path to a .json file or inline JSON; "
+                    f"could not parse as JSON: {e}"
+                )
+        logits_processors = [JSONLogitsProcessor(schema, tokenizer)]
+
     response = generate(
         model,
         tokenizer,
@@ -2319,6 +2347,7 @@ def main():
         max_tokens=args.max_tokens,
         verbose=args.verbose,
         sampler=sampler,
+        logits_processors=logits_processors,
         max_kv_size=args.max_kv_size,
         prompt_cache=prompt_cache if using_cache else None,
         kv_bits=args.kv_bits,

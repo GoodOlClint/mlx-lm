@@ -150,6 +150,70 @@ processors are applied in order.
 Some standard sampling functions and logits processors are provided in
 `mlx_lm.sample_utils`.
 
+#### Structured Output
+
+`mlx_lm.structured` provides logits processors that constrain generation to
+JSON conforming to a schema, a regex, or one of a fixed set of choices.
+These processors are designed to compose with speculative decoding (both
+external draft models via `--draft-model` and native MTP via `--mtp`):
+
+```python
+from mlx_lm import generate, load
+from mlx_lm.structured import JSONLogitsProcessor, ChoiceLogitsProcessor
+
+model, tokenizer = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
+
+schema = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "age": {"type": "integer"},
+    },
+    "required": ["name", "age"],
+}
+
+text = generate(
+    model,
+    tokenizer,
+    prompt="Return JSON for a person named Alice, age 30.",
+    logits_processors=[JSONLogitsProcessor(schema, tokenizer)],
+)
+
+# Or constrain to a fixed set of choices:
+text = generate(
+    model,
+    tokenizer,
+    prompt="Did Einstein win a Nobel Prize? Answer yes or no.",
+    logits_processors=[ChoiceLogitsProcessor(["yes", "no"], tokenizer)],
+    max_tokens=4,
+)
+```
+
+`JSONLogitsProcessor` accepts a dict (raw JSON Schema), a JSON string, or a
+Pydantic `BaseModel` subclass. The CLI exposes the same with
+`--json-schema PATH_OR_INLINE`:
+
+```
+mlx_lm.generate --model ... --prompt "..." --json-schema schema.json
+mlx_lm.generate --model ... --prompt "..." --json-schema '{"type":"string"}'
+```
+
+The OpenAI-compatible server supports `response_format={"type":
+"json_schema", "json_schema": {...}}` and `response_format={"type":
+"json_object"}` on chat completions.
+
+##### How this differs from `outlines.from_mlxlm()`
+
+Outlines' `from_mlxlm()` wrapper replaces mlx-lm's generation loop entirely
+and forfeits speculative decoding and native MTP — schema correctness comes
+at the cost of the throughput gain. The processors in `mlx_lm.structured`
+hook into mlx-lm's existing `logits_processors` parameter instead, so the
+speculative path stays active. Tradeoff: every accepted draft pays a small
+FSM `advance` and every rejection pays a `rollback_state`. On
+tightly-constrained spans (enums, integer fields) the draft model's
+freedom is reduced and acceptance rates can drop; on loosely-constrained
+spans the speculative speedup is largely preserved.
+
 ### Command Line
 
 You can also use `mlx-lm` from the command line with:

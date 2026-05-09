@@ -110,6 +110,20 @@ curl localhost:8080/v1/chat/completions \
 - `num_draft_tokens`: (Optional) The number of draft tokens the draft model
   should predict at once. Defaults to `3`.
 
+- `response_format`: (Optional) Constrain output to a JSON schema. Accepts
+  either `{"type": "json_object"}` (free-form JSON) or
+  `{"type": "json_schema", "json_schema": {...}}` (schema-enforced).
+  Composes with `draft_model` and `--mtp` — the schema processor uses
+  `outlines_core`'s native `Guide.rollback_state` to undo FSM advances on
+  rejected draft tokens, so structured output stays grammar-correct under
+  speculative decoding. For tightly-constrained schemas (enums, fixed
+  numeric ranges) draft acceptance rates may drop; loose schemas
+  (free-form strings, optional fields) preserve most of the speculative
+  speedup.
+
+- `json_schema`: (Optional, equivalent shorthand) A raw JSON schema applied
+  the same way as `response_format.json_schema`.
+
 ### Response Fields
 
 - `id`: A unique identifier for the chat.
