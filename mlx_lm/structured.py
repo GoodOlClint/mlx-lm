@@ -34,9 +34,10 @@ import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Dict, Iterable, Optional, Type, Union
+from typing import Any, Dict, Iterable, Optional, Sequence, Type, Union
 
 import mlx.core as mx
+import numpy as np
 from outlines_core import Guide, Index, outlines_core
 from outlines_core.kernels.mlx import (
     allocate_token_bitmask,
@@ -357,3 +358,317 @@ class ChoiceLogitsProcessor(RegexLogitsProcessor):
             raise TypeError("all entries in choices must be strings")
         pattern = "(" + "|".join(re.escape(c) for c in choices) + ")"
         super().__init__(pattern, tokenizer, cache=cache)
+
+
+# ---------------------------------------------------------------------------
+# Tool-aware JSON-schema processor (composes response_format + tools)
+# ---------------------------------------------------------------------------
+
+
+# Phase labels for ToolAwareJSONLogitsProcessor. Module-level so tests can
+# import them without poking at private class attributes.
+_PHASE_IDLE = "idle"
+_PHASE_OPEN_PREFIX = "open_prefix"
+_PHASE_TOOL_BODY = "tool_body"
+_PHASE_CLOSE_PREFIX = "close_prefix"
+_PHASE_IN_SCHEMA = "in_schema"
+_PHASE_FINISHED = "finished"
+
+
+class ToolAwareJSONLogitsProcessor:
+    """Composes JSON-schema constrained output with tool-call delimiters.
+
+    Use this when a chat-completions request carries BOTH ``response_format``
+    (JSON schema) AND ``tools``. The plain ``JSONLogitsProcessor`` masks out
+    the tokens that open a tool-call block (e.g. ``<tool_call>``), which
+    silently makes tool dispatch unreachable. This wrapper runs a small
+    phase machine alongside the Outlines ``Guide`` so the model can choose,
+    at the start of its response and after any tool-call close, to either
+    open another tool call OR begin emitting schema-conformant content.
+
+    Phases (per generation step):
+
+    * ``idle`` — start of response, or just after a tool-call close. Bitmask
+      permits the union of (a) tokens accepted by the schema Guide and
+      (b) the first token of ``tool_call_start_tokens``.
+    * ``open_prefix`` — committed to a tool-call open; forces the next
+      token of ``tool_call_start_tokens``.
+    * ``tool_body`` — pass-through (chat template / tool parser drives
+      content). Watches for the start of ``tool_call_end_tokens``.
+    * ``close_prefix`` — partially through ``tool_call_end_tokens``;
+      pass-through. Returns to ``idle`` on completion, or back to
+      ``tool_body`` on a false start.
+    * ``in_schema`` — Guide drives the bitmask normally.
+    * ``finished`` — schema Guide reached a final state; pass-through
+      (EOS / stop sequence expected next).
+
+    Composes with speculative / MTP decoding: the phase history is
+    rebuilt from the ``tokens`` argument on every call. On rollback,
+    phase entries are popped and the Guide is rolled back by the count
+    of *schema-mode* tokens in the rolled-back suffix (tool-mode tokens
+    never advanced the Guide).
+
+    Scope: this processor does NOT schema-constrain the tool-call body
+    itself. The body grammar is parser-specific (qwen3_coder uses XML-ish
+    ``<function=...><parameter=...>``; hermes_json uses JSON) and the
+    chat template trains the model to produce it. Constraining the body
+    against ``tools[i].function.parameters`` is a future additive feature.
+    """
+
+    def __init__(
+        self,
+        schema,
+        tokenizer,
+        tool_call_start_tokens: Sequence[int],
+        tool_call_end_tokens: Optional[Sequence[int]] = None,
+        cache: Optional[StructuredProcessorCache] = None,
+    ):
+        if not tool_call_start_tokens:
+            raise ValueError(
+                "tool_call_start_tokens must be a non-empty sequence of ints"
+            )
+        self._open_seq = tuple(int(t) for t in tool_call_start_tokens)
+        self._close_seq = (
+            tuple(int(t) for t in tool_call_end_tokens)
+            if tool_call_end_tokens
+            else ()
+        )
+
+        schema_str = _resolve_schema(schema)
+        regex = outlines_core.json_schema.build_regex_from_schema(schema_str)
+        if cache is None:
+            vocab = _build_outlines_vocabulary(tokenizer)
+            self._index = Index(regex, vocab)
+        else:
+            self._index = cache.get_index_for_regex(regex, tokenizer)
+        self._guide = Guide(self._index)
+        self._vocab_size = tokenizer.vocab_size
+        self._bitmask = allocate_token_bitmask(self._vocab_size)
+
+        # Token suffix we've already stepped the phase machine through,
+        # and the corresponding per-position state. Both grow by one entry
+        # per accepted post-prompt token. _states[i] is the state AFTER
+        # processing _advanced_suffix[i].
+        self._advanced_suffix: list[int] = []
+        self._states: list[tuple] = []
+        self._prompt_len: Optional[int] = None
+
+    # ----- public reset hook ----------------------------------------------
+
+    def reset(self) -> None:
+        self._guide = Guide(self._index)
+        self._advanced_suffix = []
+        self._states = []
+        self._prompt_len = None
+
+    # ----- helpers --------------------------------------------------------
+
+    @staticmethod
+    def _to_int_list(tokens: mx.array) -> list[int]:
+        if tokens is None:
+            return []
+        if not hasattr(tokens, "size") or tokens.size == 0:
+            return []
+        return [int(t) for t in tokens.tolist()]
+
+    def _current_state(self) -> tuple:
+        """The state used as a baseline for the next transition."""
+        if self._states:
+            return self._states[-1]
+        return (_PHASE_IDLE, 0, 0)
+
+    def _set_bit(self, token_id: int) -> None:
+        """OR a single token bit into ``self._bitmask``."""
+        if 0 <= token_id < self._vocab_size:
+            self._bitmask[0, token_id >> 5] |= np.int32(1 << (token_id & 31))
+
+    def _force_only(self, token_id: int) -> None:
+        """Zero ``self._bitmask`` and set only ``token_id``'s bit."""
+        self._bitmask[:] = 0
+        self._set_bit(token_id)
+
+    # ----- phase transition (advances Guide as side effect) ---------------
+
+    def _advance_schema(self, t: int, schema_count: int) -> Optional[tuple]:
+        """Try to advance the Guide by ``t``; return new state or None if not accepted."""
+        if not self._guide.accepts_tokens([t]):
+            return None
+        self._guide.advance(t, return_tokens=False)
+        new_sc = schema_count + 1
+        if self._guide.is_finished():
+            return (_PHASE_FINISHED, 0, new_sc)
+        return (_PHASE_IN_SCHEMA, 0, new_sc)
+
+    def _transition_idle(self, state: tuple, t: int) -> tuple:
+        _, _, sc = state
+        if t == self._open_seq[0]:
+            if len(self._open_seq) == 1:
+                return (_PHASE_TOOL_BODY, 0, sc)
+            return (_PHASE_OPEN_PREFIX, 1, sc)
+        # Not the open token; try schema entry.
+        advanced = self._advance_schema(t, sc)
+        return advanced if advanced is not None else state
+
+    def _transition_open_prefix(self, state: tuple, _t: int) -> tuple:
+        # We forced this token via the bitmask. Whether the actual token
+        # matches or not (e.g., an MTP draft that's about to be rejected),
+        # advance the phase machine to what we expect the verified timeline
+        # to look like — rollback will fix mismatches.
+        _, match_pos, sc = state
+        new_mp = match_pos + 1
+        if new_mp >= len(self._open_seq):
+            return (_PHASE_TOOL_BODY, 0, sc)
+        return (_PHASE_OPEN_PREFIX, new_mp, sc)
+
+    def _transition_tool_body(self, state: tuple, t: int) -> tuple:
+        _, _, sc = state
+        if self._close_seq and t == self._close_seq[0]:
+            if len(self._close_seq) == 1:
+                return (_PHASE_IDLE, 0, sc)
+            return (_PHASE_CLOSE_PREFIX, 1, sc)
+        return (_PHASE_TOOL_BODY, 0, sc)
+
+    def _transition_close_prefix(self, state: tuple, t: int) -> tuple:
+        _, match_pos, sc = state
+        expected = (
+            self._close_seq[match_pos] if match_pos < len(self._close_seq) else None
+        )
+        if expected is None or t != expected:
+            # Model bailed on closing — fall back into tool_body.
+            return (_PHASE_TOOL_BODY, 0, sc)
+        new_mp = match_pos + 1
+        if new_mp >= len(self._close_seq):
+            return (_PHASE_IDLE, 0, sc)
+        return (_PHASE_CLOSE_PREFIX, new_mp, sc)
+
+    def _transition_in_schema(self, state: tuple, t: int) -> tuple:
+        _, _, sc = state
+        advanced = self._advance_schema(t, sc)
+        return advanced if advanced is not None else state
+
+    _TRANSITION_TABLE = {
+        _PHASE_IDLE: _transition_idle,
+        _PHASE_OPEN_PREFIX: _transition_open_prefix,
+        _PHASE_TOOL_BODY: _transition_tool_body,
+        _PHASE_CLOSE_PREFIX: _transition_close_prefix,
+        _PHASE_IN_SCHEMA: _transition_in_schema,
+    }
+
+    def _transition(self, state: tuple, t: int) -> tuple:
+        handler = self._TRANSITION_TABLE.get(state[0])
+        if handler is None:
+            # _PHASE_FINISHED — terminal, no further Guide motion.
+            return state
+        return handler(self, state, t)
+
+    # ----- sync (rollback + advance) --------------------------------------
+
+    def _rollback_or_rebuild(self, suffix: list, common: int) -> bool:
+        """Rewind state to ``common`` post-prompt tokens.
+
+        Returns True if a full rebuild happened (in which case the caller
+        does not need to advance — we've already replayed the common
+        prefix). Returns False if a simple in-place truncation sufficed.
+        """
+        old_total_schema = self._current_state()[2]
+        new_target_schema = self._states[common - 1][2] if common > 0 else 0
+        schema_rollback = old_total_schema - new_target_schema
+        if schema_rollback > 0:
+            allowed = self._guide.get_allowed_rollback()
+            if schema_rollback > allowed:
+                # Outlines-core's rollback buffer is bounded. Rebuild by
+                # replaying schema-mode tokens through a fresh Guide.
+                self._guide = Guide(self._index)
+                self._advanced_suffix = []
+                self._states = []
+                self._advance_new_tail(suffix, 0)
+                # The caller's "advance through new tail" is now redundant.
+                # Truncate any over-replay (suffix may extend past `common`
+                # — that part wasn't in the old history anyway).
+                return True
+            self._guide.rollback_state(schema_rollback)
+        del self._advanced_suffix[common:]
+        del self._states[common:]
+        return False
+
+    def _sync(self, tokens: mx.array) -> None:
+        token_list = self._to_int_list(tokens)
+        if self._prompt_len is None:
+            self._prompt_len = len(token_list)
+            self._advanced_suffix = []
+            self._states = []
+            return
+        suffix = token_list[self._prompt_len :]
+
+        # Longest common prefix between previous suffix and new suffix.
+        common = 0
+        for a, b in zip(self._advanced_suffix, suffix):
+            if a != b:
+                break
+            common += 1
+
+        if len(self._advanced_suffix) - common > 0:
+            if self._rollback_or_rebuild(suffix, common):
+                return
+
+        self._advance_new_tail(suffix, len(self._advanced_suffix))
+
+    def _advance_new_tail(self, suffix: list, start: int) -> None:
+        """Advance the phase machine over ``suffix[start:]``."""
+        for tok in suffix[start:]:
+            new_state = self._transition(self._current_state(), tok)
+            # Determine whether this token was "absorbed" into the state.
+            # Currently every branch of _transition returns the input
+            # state unchanged ONLY when the token was an FSM-invalid
+            # candidate in IDLE / IN_SCHEMA (rejected draft). In that
+            # case we skip recording so a later rollback's diff doesn't
+            # try to undo it. Mirrors _RollbackingLogitsProcessor.
+            absorbed = new_state != self._current_state() or self._is_pass_through(
+                new_state[0]
+            )
+            if absorbed:
+                self._states.append(new_state)
+                self._advanced_suffix.append(tok)
+
+    @staticmethod
+    def _is_pass_through(phase: str) -> bool:
+        return phase in (_PHASE_TOOL_BODY, _PHASE_CLOSE_PREFIX, _PHASE_FINISHED)
+
+    # ----- __call__ -------------------------------------------------------
+
+    def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
+        self._sync(tokens)
+        phase, match_pos, _ = self._current_state()
+
+        if phase == _PHASE_IDLE:
+            fill_next_token_bitmask(self._guide, self._bitmask)
+            self._set_bit(self._open_seq[0])
+        elif phase == _PHASE_OPEN_PREFIX:
+            self._force_only(self._open_seq[match_pos])
+        elif phase in (_PHASE_IN_SCHEMA, _PHASE_FINISHED):
+            # At FINISHED, the Guide's bitmask permits only the EOS bit
+            # (outlines-core convention at FSM final states). Applying it
+            # here forces the model to stop instead of continuing to emit
+            # free-form text after the schema closes — which would let
+            # Qwen-style chat templates that auto-enter `<think>` emit a
+            # second un-constrained JSON in the post-thinking content
+            # region.
+            fill_next_token_bitmask(self._guide, self._bitmask)
+        else:
+            # tool_body, close_prefix — pass-through.
+            return logits
+
+        if logits.ndim == 1:
+            biased = apply_token_bitmask(logits[None], self._bitmask)
+            return biased.squeeze(0)
+        return apply_token_bitmask(logits, self._bitmask)
+
+    # ----- introspection (used by tests) ----------------------------------
+
+    @property
+    def phase(self) -> str:
+        return self._current_state()[0]
+
+    @property
+    def is_finished(self) -> bool:
+        return self.phase == _PHASE_FINISHED

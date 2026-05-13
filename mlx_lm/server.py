@@ -43,7 +43,7 @@ from .models.cache import (
     make_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
-from .structured import StructuredProcessorCache
+from .structured import StructuredProcessorCache, ToolAwareJSONLogitsProcessor
 from .utils import _parse_size, load, sharded_load
 
 
@@ -689,6 +689,33 @@ class ResponseGenerator:
     def _is_batchable(self, args):
         return self.model_provider.is_batchable and args.seed is None
 
+    def _make_structured_processor(self, request, tokenizer):
+        """Select the right structured-output processor for ``request``.
+
+        Returns ``None`` when there is no ``json_schema``. When both a
+        schema and ``tools`` are present on a tool-calling tokenizer, the
+        tool-aware wrapper is selected so the model can still emit
+        ``<tool_call>`` blocks (issue #1). Otherwise the plain
+        ``JSONLogitsProcessor`` path is used.
+        """
+        schema = request.json_schema
+        if schema is None:
+            return None
+        tools = request.tools if request.request_type == "chat" else None
+        if (
+            tools
+            and tokenizer.has_tool_calling
+            and tokenizer.tool_call_start_tokens
+        ):
+            return ToolAwareJSONLogitsProcessor(
+                schema,
+                tokenizer,
+                tool_call_start_tokens=tokenizer.tool_call_start_tokens,
+                tool_call_end_tokens=tokenizer.tool_call_end_tokens,
+                cache=self.processor_cache,
+            )
+        return self.processor_cache.get_processor(schema, tokenizer)
+
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
         # sure that all generation runs in the same stream as the
@@ -777,8 +804,8 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
-                    proc = self.processor_cache._make_structured_processor(
-                        request.json_schema, current_tokenizer
+                    proc = self._make_structured_processor(
+                        request, current_tokenizer
                     )
                     base_logits_processors = _make_logits_processors(args)
                     if proc is not None:
@@ -977,10 +1004,8 @@ class ResponseGenerator:
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
-            # make a structrued one if there is a schema
-            proc = self.processor_cache._make_structured_processor(
-                request.json_schema, tokenizer
-            )
+            # make a structured one if there is a schema
+            proc = self._make_structured_processor(request, tokenizer)
             if proc is not None:
                 logits_processors = [*logits_processors, proc]
 

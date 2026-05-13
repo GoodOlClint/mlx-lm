@@ -119,7 +119,17 @@ curl localhost:8080/v1/chat/completions \
   speculative decoding. For tightly-constrained schemas (enums, fixed
   numeric ranges) draft acceptance rates may drop; loose schemas
   (free-form strings, optional fields) preserve most of the speculative
-  speedup.
+  speedup. Composes with `tools` on tool-calling tokenizers: when
+  both are set, the model may emit zero or more
+  `<tool_call>...</tool_call>` blocks before producing the
+  schema-conformant final response. After each `</tool_call>` the
+  processor returns to a choice state where the model can either
+  open another tool call or commit to schema output, so multi-step
+  tool sequences are supported without extra plumbing. The tool-call
+  body itself is not schema-constrained — its grammar is whatever
+  the chat template trains the model to produce. Once the model
+  emits its first non-tool-call token, it has committed to schema
+  output for the rest of the response.
 
 - `json_schema`: (Optional, equivalent shorthand) A raw JSON schema applied
   the same way as `response_format.json_schema`.

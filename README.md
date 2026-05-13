@@ -200,7 +200,17 @@ mlx_lm.generate --model ... --prompt "..." --json-schema '{"type":"string"}'
 
 The OpenAI-compatible server supports `response_format={"type":
 "json_schema", "json_schema": {...}}` and `response_format={"type":
-"json_object"}` on chat completions.
+"json_object"}` on chat completions. When a chat-completions request
+sets both `response_format` and `tools`, the server automatically
+swaps in a tool-aware processor (`ToolAwareJSONLogitsProcessor`) so
+the model can emit zero or more `<tool_call>...</tool_call>` blocks
+before its schema-conformant final response. After each
+`</tool_call>` the processor returns to a "choice" state where the
+model can either open *another* tool call or begin schema output —
+so multi-step tool sequences work without any extra plumbing. The
+body of each tool-call is unconstrained (the chat template's natural
+tool grammar applies). Once the model emits a non-tool-call token,
+it has committed to schema output for the remainder of the response.
 
 ##### How this differs from `outlines.from_mlxlm()`
 
