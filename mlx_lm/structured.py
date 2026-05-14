@@ -371,66 +371,116 @@ _PHASE_IDLE = "idle"
 _PHASE_OPEN_PREFIX = "open_prefix"
 _PHASE_TOOL_BODY = "tool_body"
 _PHASE_CLOSE_PREFIX = "close_prefix"
+_PHASE_THINK_BODY = "think_body"
+_PHASE_THINK_CLOSE_PREFIX = "think_close_prefix"
 _PHASE_IN_SCHEMA = "in_schema"
 _PHASE_FINISHED = "finished"
 
 
 class ToolAwareJSONLogitsProcessor:
-    """Composes JSON-schema constrained output with tool-call delimiters.
+    """Pass-through-by-default schema processor that composes with tools and thinking.
 
-    Use this when a chat-completions request carries BOTH ``response_format``
-    (JSON schema) AND ``tools``. The plain ``JSONLogitsProcessor`` masks out
-    the tokens that open a tool-call block (e.g. ``<tool_call>``), which
-    silently makes tool dispatch unreachable. This wrapper runs a small
-    phase machine alongside the Outlines ``Guide`` so the model can choose,
-    at the start of its response and after any tool-call close, to either
-    open another tool call OR begin emitting schema-conformant content.
+    Patch 6 design (supersedes Patch 4/5's strict-from-start bitmask):
+    schema enforcement is **deferred** until the model voluntarily commits
+    to JSON output by emitting ``{``. Before that, the model is free to
+    emit anything — preamble text, ``<think>`` blocks, ``<tool_call>``
+    blocks, markdown fences — without any bitmask constraint. After
+    ``{``, the Outlines ``Guide`` enforces strict schema validity on the
+    JSON body. After the JSON body completes, the processor returns to
+    pass-through so the model can emit closing markdown fences and stop
+    naturally.
+
+    Background — why deferred enforcement (issue #4):
+    Patch 4/5 applied a bitmask in ``idle`` (Guide ∪ tool_open ∪
+    think_open). Under tool-aware Qwen3.5, this caused the model to
+    deterministically pick the minimum-compliant DFA path (empty
+    arrays, empty schema shell) under the influence of the chat
+    template's tool documentation prompt. Live bisection showed the
+    bitmask itself was the cause — a literal no-op processor restored
+    natural model behavior (full content, tool calls firing). Patch 6
+    achieves the same by making ``idle`` truly pass-through.
 
     Phases (per generation step):
 
-    * ``idle`` — start of response, or just after a tool-call close. Bitmask
-      permits the union of (a) tokens accepted by the schema Guide and
-      (b) the first token of ``tool_call_start_tokens``.
-    * ``open_prefix`` — committed to a tool-call open; forces the next
-      token of ``tool_call_start_tokens``.
-    * ``tool_body`` — pass-through (chat template / tool parser drives
-      content). Watches for the start of ``tool_call_end_tokens``.
-    * ``close_prefix`` — partially through ``tool_call_end_tokens``;
-      pass-through. Returns to ``idle`` on completion, or back to
-      ``tool_body`` on a false start.
-    * ``in_schema`` — Guide drives the bitmask normally.
-    * ``finished`` — schema Guide reached a final state; pass-through
-      (EOS / stop sequence expected next).
+    * ``idle`` — start of response, or just after a ``</tool_call>`` /
+      ``</think>``. **Pass-through.** Watches for one of three
+      commitment signals: ``tool_call_start_tokens[0]``,
+      ``think_start_tokens[0]``, or the literal ``{`` token. Other
+      tokens leave the phase unchanged.
+    * ``open_prefix`` — multi-token tool-call open in progress; forces
+      the next token of ``tool_call_start_tokens``.
+    * ``tool_body`` — pass-through (chat-template's tool grammar
+      applies). Watches for ``tool_call_end_tokens[0]``.
+    * ``close_prefix`` — multi-token tool-call close in progress;
+      pass-through. Returns to ``idle`` on completion, ``tool_body``
+      on a false start.
+    * ``think_body`` — pass-through. Watches for
+      ``think_end_tokens[0]``. The phase machine also *starts* in
+      ``think_body`` when the prompt ends inside a ``<think>`` block
+      (Qwen3.5/3.6 chat-template auto-injection — see
+      ``_detect_initial_phase``).
+    * ``think_close_prefix`` — multi-token think close in progress;
+      pass-through. Returns to ``idle`` on completion, ``think_body``
+      on a false start.
+    * ``in_schema`` — strict Guide enforcement. Active from ``{``
+      through the final ``}``.
+    * ``finished`` — Guide reached its final state. **Pass-through**
+      (Patch 6, was: forced EOS in Patch 5) so the model can emit
+      closing markdown fences and stop on its own.
 
     Composes with speculative / MTP decoding: the phase history is
     rebuilt from the ``tokens`` argument on every call. On rollback,
     phase entries are popped and the Guide is rolled back by the count
-    of *schema-mode* tokens in the rolled-back suffix (tool-mode tokens
-    never advanced the Guide).
+    of *schema-mode* tokens in the rolled-back suffix (idle / tool /
+    think / finished tokens never advanced the Guide).
 
-    Scope: this processor does NOT schema-constrain the tool-call body
-    itself. The body grammar is parser-specific (qwen3_coder uses XML-ish
-    ``<function=...><parameter=...>``; hermes_json uses JSON) and the
-    chat template trains the model to produce it. Constraining the body
-    against ``tools[i].function.parameters`` is a future additive feature.
+    Scope: this processor does NOT schema-constrain anything outside the
+    ``{...}`` JSON body. The tool-call body's grammar is parser-specific
+    (qwen3_coder uses XML-ish ``<function=...><parameter=...>``;
+    hermes_json uses JSON); think bodies are free-form natural language.
+    The chat template trains the model to produce these correctly.
     """
 
     def __init__(
         self,
         schema,
         tokenizer,
-        tool_call_start_tokens: Sequence[int],
+        tool_call_start_tokens: Optional[Sequence[int]] = None,
         tool_call_end_tokens: Optional[Sequence[int]] = None,
+        think_start_tokens: Optional[Sequence[int]] = None,
+        think_end_tokens: Optional[Sequence[int]] = None,
         cache: Optional[StructuredProcessorCache] = None,
     ):
-        if not tool_call_start_tokens:
+        # Tool delimiters (Patch 4) are optional; without them the processor
+        # acts as a thinking-aware schema processor only. Think delimiters
+        # (Patch 5) are also optional; without them it acts as the
+        # tool-aware processor only. With both, it composes tool-calling +
+        # thinking + schema. At least one must be provided — with neither,
+        # callers should use ``JSONLogitsProcessor`` directly.
+        if not tool_call_start_tokens and not think_start_tokens:
             raise ValueError(
-                "tool_call_start_tokens must be a non-empty sequence of ints"
+                "at least one of tool_call_start_tokens or think_start_tokens "
+                "must be a non-empty sequence; use JSONLogitsProcessor for "
+                "plain schema-only output"
             )
-        self._open_seq = tuple(int(t) for t in tool_call_start_tokens)
+        self._open_seq = (
+            tuple(int(t) for t in tool_call_start_tokens)
+            if tool_call_start_tokens
+            else ()
+        )
         self._close_seq = (
             tuple(int(t) for t in tool_call_end_tokens)
             if tool_call_end_tokens
+            else ()
+        )
+        self._think_open_seq = (
+            tuple(int(t) for t in think_start_tokens)
+            if think_start_tokens
+            else ()
+        )
+        self._think_close_seq = (
+            tuple(int(t) for t in think_end_tokens)
+            if think_end_tokens
             else ()
         )
 
@@ -452,6 +502,41 @@ class ToolAwareJSONLogitsProcessor:
         self._advanced_suffix: list[int] = []
         self._states: list[tuple] = []
         self._prompt_len: Optional[int] = None
+        # Initial phase is normally IDLE, but Qwen3.5-class chat templates
+        # auto-inject ``<think>`` after ``<|im_start|>assistant\n`` so the
+        # model is already inside a think block when generation begins. We
+        # detect that on the first sync and set this to THINK_BODY so the
+        # processor doesn't immediately mask out the model's thinking
+        # tokens (issue #2).
+        self._initial_phase: str = _PHASE_IDLE
+        # The token id that signals "the model is starting JSON output"
+        # — i.e., the literal ``{`` for object-root schemas. Patch 6
+        # uses this to trigger the transition from pass-through IDLE
+        # into Guide-enforced IN_SCHEMA. Pre-compute at construction so
+        # we don't have to query the tokenizer per call.
+        #
+        # Why this matters (issue #4 root cause):
+        # When the schema bitmask is active from the first generated
+        # token, Qwen3.5 (and similar tool-aware models) get pinned to
+        # the minimum-compliant DFA path under the influence of the
+        # chat-template's tool documentation — emitting an empty schema
+        # shell like ``{"events": []}`` and stopping. Deferring schema
+        # enforcement until the model voluntarily commits to JSON
+        # (emits ``{``) lets the model write preamble / think / tool-
+        # call freely first, then enforces validity on the JSON portion.
+        self._json_open_token: Optional[int] = None
+        if hasattr(tokenizer, "encode"):
+            try:
+                json_open_ids = tokenizer.encode("{", add_special_tokens=False)
+                if len(json_open_ids) == 1:
+                    self._json_open_token = int(json_open_ids[0])
+            except (TypeError, ValueError):
+                # Some test fixtures or minimal tokenizers may not support
+                # the (text, add_special_tokens=...) call shape. Without a
+                # known JSON-open token, the processor stays in pass-through
+                # IDLE forever; schema enforcement never activates. Callers
+                # depending on enforcement should ensure a real tokenizer.
+                pass
 
     # ----- public reset hook ----------------------------------------------
 
@@ -475,7 +560,45 @@ class ToolAwareJSONLogitsProcessor:
         """The state used as a baseline for the next transition."""
         if self._states:
             return self._states[-1]
-        return (_PHASE_IDLE, 0, 0)
+        return (self._initial_phase, 0, 0)
+
+    def _detect_initial_phase(self, prompt_tokens: list) -> str:
+        """Determine whether the prompt ends inside a ``<think>`` block.
+
+        Some chat templates (Qwen3.5 default) auto-inject ``<think>``
+        after ``<|im_start|>assistant\\n``, so the model's first
+        generated token is semantically inside a think block. If we don't
+        detect this, the IDLE phase's schema-Guide bitmask will mask out
+        every non-schema token and the model can't produce reasoning at
+        all — the schema gets satisfied inside think and EOS forces an
+        empty / minimal content (issue #2).
+
+        Single-token delimiter detection only — Qwen3.5/3.6 have
+        ``<think>``/``</think>`` as single special tokens. Multi-token
+        delimiters fall back to IDLE conservatively; if the template uses
+        them and auto-injects ``<think>``, a small extension to do
+        subsequence matching against the prompt tail would be needed.
+        """
+        if not self._think_open_seq:
+            return _PHASE_IDLE
+        if len(self._think_open_seq) != 1:
+            return _PHASE_IDLE
+        if self._think_close_seq and len(self._think_close_seq) != 1:
+            return _PHASE_IDLE
+        open_id = self._think_open_seq[0]
+        close_id = self._think_close_seq[0] if self._think_close_seq else None
+        last_open = -1
+        last_close = -1
+        scan_start = max(0, len(prompt_tokens) - 256)
+        for i in range(scan_start, len(prompt_tokens)):
+            t = prompt_tokens[i]
+            if t == open_id:
+                last_open = i
+            elif close_id is not None and t == close_id:
+                last_close = i
+        if last_open > last_close:
+            return _PHASE_THINK_BODY
+        return _PHASE_IDLE
 
     def _set_bit(self, token_id: int) -> None:
         """OR a single token bit into ``self._bitmask``."""
@@ -500,14 +623,61 @@ class ToolAwareJSONLogitsProcessor:
         return (_PHASE_IN_SCHEMA, 0, new_sc)
 
     def _transition_idle(self, state: tuple, t: int) -> tuple:
+        """Patch 6: IDLE is pass-through. Watch for commitment signals.
+
+        The model can emit anything here (preamble like "Here is the
+        JSON:", or a leading newline, etc.). We only transition out of
+        IDLE when we see an unambiguous commitment to one of three
+        modes: tool-call open, think open, or the JSON opening brace.
+        Tokens that don't match any signal leave the phase unchanged.
+        """
         _, _, sc = state
-        if t == self._open_seq[0]:
+        if self._open_seq and t == self._open_seq[0]:
             if len(self._open_seq) == 1:
                 return (_PHASE_TOOL_BODY, 0, sc)
             return (_PHASE_OPEN_PREFIX, 1, sc)
-        # Not the open token; try schema entry.
-        advanced = self._advance_schema(t, sc)
-        return advanced if advanced is not None else state
+        if self._think_open_seq and t == self._think_open_seq[0]:
+            if len(self._think_open_seq) == 1:
+                return (_PHASE_THINK_BODY, 0, sc)
+            # Multi-token think_open: treat as committed once first
+            # token matches (we don't have prefix-matching for think).
+            return (_PHASE_THINK_BODY, 0, sc)
+        if self._json_open_token is not None and t == self._json_open_token:
+            # The model committed to JSON output. Advance the Guide with
+            # ``{`` (which the schema regex always accepts at the initial
+            # state for object-root schemas) and enter strict-enforcement
+            # mode for the rest of the JSON body.
+            if self._guide.accepts_tokens([t]):
+                self._guide.advance(t, return_tokens=False)
+                new_sc = sc + 1
+                if self._guide.is_finished():
+                    return (_PHASE_FINISHED, 0, new_sc)
+                return (_PHASE_IN_SCHEMA, 0, new_sc)
+        # No commitment yet — stay in IDLE pass-through.
+        return state
+
+    def _transition_think_body(self, state: tuple, t: int) -> tuple:
+        _, _, sc = state
+        if self._think_close_seq and t == self._think_close_seq[0]:
+            if len(self._think_close_seq) == 1:
+                return (_PHASE_IDLE, 0, sc)
+            return (_PHASE_THINK_CLOSE_PREFIX, 1, sc)
+        return (_PHASE_THINK_BODY, 0, sc)
+
+    def _transition_think_close_prefix(self, state: tuple, t: int) -> tuple:
+        _, match_pos, sc = state
+        expected = (
+            self._think_close_seq[match_pos]
+            if match_pos < len(self._think_close_seq)
+            else None
+        )
+        if expected is None or t != expected:
+            # Model bailed on closing — fall back into think_body.
+            return (_PHASE_THINK_BODY, 0, sc)
+        new_mp = match_pos + 1
+        if new_mp >= len(self._think_close_seq):
+            return (_PHASE_IDLE, 0, sc)
+        return (_PHASE_THINK_CLOSE_PREFIX, new_mp, sc)
 
     def _transition_open_prefix(self, state: tuple, _t: int) -> tuple:
         # We forced this token via the bitmask. Whether the actual token
@@ -551,6 +721,8 @@ class ToolAwareJSONLogitsProcessor:
         _PHASE_OPEN_PREFIX: _transition_open_prefix,
         _PHASE_TOOL_BODY: _transition_tool_body,
         _PHASE_CLOSE_PREFIX: _transition_close_prefix,
+        _PHASE_THINK_BODY: _transition_think_body,
+        _PHASE_THINK_CLOSE_PREFIX: _transition_think_close_prefix,
         _PHASE_IN_SCHEMA: _transition_in_schema,
     }
 
@@ -597,6 +769,7 @@ class ToolAwareJSONLogitsProcessor:
             self._prompt_len = len(token_list)
             self._advanced_suffix = []
             self._states = []
+            self._initial_phase = self._detect_initial_phase(token_list)
             return
         suffix = token_list[self._prompt_len :]
 
@@ -632,7 +805,18 @@ class ToolAwareJSONLogitsProcessor:
 
     @staticmethod
     def _is_pass_through(phase: str) -> bool:
-        return phase in (_PHASE_TOOL_BODY, _PHASE_CLOSE_PREFIX, _PHASE_FINISHED)
+        # Patch 6: IDLE and FINISHED are now pass-through too. The only
+        # phases that apply a bitmask are OPEN_PREFIX (forces the next
+        # token of a multi-token tool_call_start) and IN_SCHEMA (strict
+        # Guide enforcement).
+        return phase in (
+            _PHASE_IDLE,
+            _PHASE_TOOL_BODY,
+            _PHASE_CLOSE_PREFIX,
+            _PHASE_THINK_BODY,
+            _PHASE_THINK_CLOSE_PREFIX,
+            _PHASE_FINISHED,
+        )
 
     # ----- __call__ -------------------------------------------------------
 
@@ -640,22 +824,24 @@ class ToolAwareJSONLogitsProcessor:
         self._sync(tokens)
         phase, match_pos, _ = self._current_state()
 
-        if phase == _PHASE_IDLE:
-            fill_next_token_bitmask(self._guide, self._bitmask)
-            self._set_bit(self._open_seq[0])
-        elif phase == _PHASE_OPEN_PREFIX:
+        if phase == _PHASE_OPEN_PREFIX:
+            # Forced multi-token tool-open sequence. Honor the bitmask.
             self._force_only(self._open_seq[match_pos])
-        elif phase in (_PHASE_IN_SCHEMA, _PHASE_FINISHED):
-            # At FINISHED, the Guide's bitmask permits only the EOS bit
-            # (outlines-core convention at FSM final states). Applying it
-            # here forces the model to stop instead of continuing to emit
-            # free-form text after the schema closes — which would let
-            # Qwen-style chat templates that auto-enter `<think>` emit a
-            # second un-constrained JSON in the post-thinking content
-            # region.
+        elif phase == _PHASE_IN_SCHEMA:
+            # Strict schema enforcement on the JSON portion of the response.
             fill_next_token_bitmask(self._guide, self._bitmask)
         else:
-            # tool_body, close_prefix — pass-through.
+            # Patch 6: idle, tool_body, close_prefix, think_body,
+            # think_close_prefix, finished — all pass-through. The model
+            # is free to emit anything (preamble, thinking, tool calls,
+            # trailing markdown fences). The wrapper just watches the
+            # token stream for transition signals (``<tool_call>``,
+            # ``<think>``, ``{``, etc.) via ``_sync`` / ``_transition``.
+            #
+            # FINISHED used to force EOS via the Guide bitmask. We make
+            # it pass-through now so the model can naturally close any
+            # surrounding markdown fences or close-think markers after
+            # the JSON body completes.
             return logits
 
         if logits.ndim == 1:

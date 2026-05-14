@@ -37,6 +37,8 @@ from mlx_lm.structured import (
     _PHASE_IDLE,
     _PHASE_IN_SCHEMA,
     _PHASE_OPEN_PREFIX,
+    _PHASE_THINK_BODY,
+    _PHASE_THINK_CLOSE_PREFIX,
     _PHASE_TOOL_BODY,
     _RollbackingLogitsProcessor,
     _resolve_schema,
@@ -550,13 +552,30 @@ class TestToolAwareProcessor(unittest.TestCase):
     def setUpClass(cls):
         cls.tokenizer = _ToolFakeTokenizer()
 
-    def _make(self, *, open_seq=(6,), close_seq=(7,), regex=r"a{3}"):
+    def _make(
+        self,
+        *,
+        open_seq=(6,),
+        close_seq=(7,),
+        think_open_seq=(),
+        think_close_seq=(),
+        json_open_token=None,
+        regex=r"a{3}",
+    ):
         # Outlines-core can't compile an arbitrary regex out of a JSON
         # schema, so bypass the schema path: build an Index for `regex`
         # directly and inject it (same trick TestRollbackingProcessor uses).
+        # The synthetic regex is r"a{3}" — the "schema-commit" token in
+        # this fake setup is therefore 'a' (id 0) unless overridden.
         proc = ToolAwareJSONLogitsProcessor.__new__(ToolAwareJSONLogitsProcessor)
-        proc._open_seq = tuple(int(t) for t in open_seq)
+        proc._open_seq = tuple(int(t) for t in open_seq) if open_seq else ()
         proc._close_seq = tuple(int(t) for t in close_seq) if close_seq else ()
+        proc._think_open_seq = (
+            tuple(int(t) for t in think_open_seq) if think_open_seq else ()
+        )
+        proc._think_close_seq = (
+            tuple(int(t) for t in think_close_seq) if think_close_seq else ()
+        )
         proc._index = _make_index(regex, self.tokenizer)
         from outlines_core import Guide
         from outlines_core.kernels.mlx import allocate_token_bitmask
@@ -567,6 +586,10 @@ class TestToolAwareProcessor(unittest.TestCase):
         proc._advanced_suffix = []
         proc._states = []
         proc._prompt_len = None
+        proc._initial_phase = _PHASE_IDLE
+        # Patch 6: synthetic 'a' (id 0) is the JSON-commit token for the
+        # default a{3} regex unless overridden.
+        proc._json_open_token = 0 if json_open_token is None else int(json_open_token)
         return proc
 
     def _logits(self):
@@ -574,17 +597,17 @@ class TestToolAwareProcessor(unittest.TestCase):
 
     # --- single-token open/close ------------------------------------------
 
-    def test_idle_unmasks_open_and_schema(self):
+    def test_idle_is_pass_through(self):
+        """Patch 6: IDLE no longer applies a bitmask. Every token has a
+        finite logit so the model is free to emit anything (preamble,
+        ``<think>``, ``<tool_call>``, ``{``, or any other token).
+        Commitment to a specific phase happens via ``_transition_idle``
+        when a signal token is observed, not via masking."""
         proc = self._make()
-        out = proc(mx.array([5], dtype=mx.int32), self._logits())
-        row = out.tolist()[0]
-        # 'a' (schema-accepting) is finite.
-        self.assertEqual(row[0], 0.0)
-        # tool_open is finite.
-        self.assertEqual(row[6], 0.0)
-        # Anything else is -inf.
-        for forbidden in (1, 2, 3, 5, 7, 8, 9, 10, 11):
-            self.assertEqual(row[forbidden], float("-inf"))
+        logits = mx.arange(self.tokenizer.vocab_size, dtype=mx.float32)[None]
+        out = proc(mx.array([5], dtype=mx.int32), logits)
+        # Pass-through: logits returned unchanged.
+        self.assertEqual(out.tolist(), logits.tolist())
 
     def test_idle_to_tool_body_single_token_open(self):
         proc = self._make()
@@ -629,9 +652,11 @@ class TestToolAwareProcessor(unittest.TestCase):
         self.assertEqual(proc.phase, _PHASE_FINISHED)
 
     def test_multiple_consecutive_tool_calls_then_schema(self):
-        """After a close, IDLE permits opening another tool call. The
-        processor should support an arbitrary number of tool rounds
-        before the model commits to schema."""
+        """After a close, IDLE remains pass-through and the phase machine
+        watches for the next signal — either another ``<tool_call>``, a
+        ``<think>``, or ``{``. Patch 6 supports any number of tool
+        rounds before the model commits to schema, with no IDLE bitmask
+        constraining the choice."""
         proc = self._make()
         proc(mx.array([5], dtype=mx.int32), self._logits())
         # First tool call.
@@ -639,12 +664,11 @@ class TestToolAwareProcessor(unittest.TestCase):
         proc(mx.array([5, 6, 0], dtype=mx.int32), self._logits())  # body
         proc(mx.array([5, 6, 0, 7], dtype=mx.int32), self._logits())  # close
         self.assertEqual(proc.phase, _PHASE_IDLE)
-        # IDLE bitmask after a close must still unmask tool_open AND
-        # schema-accepting tokens (the model gets to choose again).
-        out = proc(mx.array([5, 6, 0, 7], dtype=mx.int32), self._logits())
-        row = out.tolist()[0]
-        self.assertEqual(row[0], 0.0)  # 'a' (schema entry)
-        self.assertEqual(row[6], 0.0)  # tool_open
+        # IDLE is pass-through after a close — the model is free to emit
+        # whatever it wants. Verify by checking logits passthrough.
+        logits = mx.arange(self.tokenizer.vocab_size, dtype=mx.float32)[None]
+        out = proc(mx.array([5, 6, 0, 7], dtype=mx.int32), logits)
+        self.assertEqual(out.tolist(), logits.tolist())
         # Second tool call (model elected to call another tool).
         proc(mx.array([5, 6, 0, 7, 6], dtype=mx.int32), self._logits())
         self.assertEqual(proc.phase, _PHASE_TOOL_BODY)
@@ -656,23 +680,28 @@ class TestToolAwareProcessor(unittest.TestCase):
         proc(mx.array([5, 6, 0, 7, 6, 1, 7, 6, 2], dtype=mx.int32), self._logits())
         proc(mx.array([5, 6, 0, 7, 6, 1, 7, 6, 2, 7], dtype=mx.int32), self._logits())
         self.assertEqual(proc.phase, _PHASE_IDLE)
-        # Now finally commit to schema.
+        # Now finally commit to schema by emitting the JSON-open token.
         proc(
             mx.array([5, 6, 0, 7, 6, 1, 7, 6, 2, 7, 0], dtype=mx.int32),
             self._logits(),
         )
         self.assertEqual(proc.phase, _PHASE_IN_SCHEMA)
 
-    def test_idle_to_schema_finite_logits_for_schema_only(self):
-        """After picking a schema token, IDLE-style unmasking is gone."""
+    def test_in_schema_applies_guide_bitmask(self):
+        """Once the model has committed to schema mode by emitting the
+        JSON-open token, the Guide bitmask kicks in and constrains the
+        rest of the JSON body. Tool-open / think-open / arbitrary text
+        are all masked off in IN_SCHEMA — only schema-conformant
+        continuations are permitted."""
         proc = self._make()
         proc(mx.array([5], dtype=mx.int32), self._logits())
         proc(mx.array([5, 0], dtype=mx.int32), self._logits())  # 'a' -> IN_SCHEMA
+        self.assertEqual(proc.phase, _PHASE_IN_SCHEMA)
         out = proc(mx.array([5, 0], dtype=mx.int32), self._logits())
         row = out.tolist()[0]
-        # tool_open should now be masked off — the model committed to schema.
+        # tool_open is masked off — the model committed to schema.
         self.assertEqual(row[6], float("-inf"))
-        # 'a' should still be available (quantifier {1,3} not yet saturated).
+        # 'a' is still available (quantifier {3} not yet saturated).
         self.assertEqual(row[0], 0.0)
 
     # --- multi-token open -------------------------------------------------
@@ -680,10 +709,12 @@ class TestToolAwareProcessor(unittest.TestCase):
     def test_multi_token_open_forces_each_step(self):
         proc = self._make(open_seq=(8, 9), close_seq=(7,))
         proc(mx.array([5], dtype=mx.int32), self._logits())
-        # IDLE: mask should allow open_seq[0] (id 8).
+        # Patch 6: IDLE is pass-through; open_seq[0] (id 8) is reachable
+        # because all tokens are reachable. The model can sample it
+        # naturally without us masking other options out.
         out = proc(mx.array([5], dtype=mx.int32), self._logits())
         self.assertEqual(out.tolist()[0][8], 0.0)
-        # Sample id 8.
+        # Sample id 8 — this commits us to the OPEN_PREFIX path.
         proc(mx.array([5, 8], dtype=mx.int32), self._logits())
         self.assertEqual(proc.phase, _PHASE_OPEN_PREFIX)
         # In OPEN_PREFIX, the next call must force ONLY open_seq[1] (id 9).
@@ -766,12 +797,12 @@ class TestToolAwareProcessor(unittest.TestCase):
 
     # --- finished phase ---------------------------------------------------
 
-    def test_finished_applies_guide_bitmask(self):
-        """At FINISHED, the Guide's bitmask permits only EOS — applying it
-        forces the model to stop instead of emitting free-form text after
-        the schema closes. This mirrors stock JSONLogitsProcessor and
-        prevents Qwen-style chat templates from emitting a second
-        un-constrained JSON after the schema satisfies inside `<think>`."""
+    def test_finished_is_pass_through(self):
+        """Patch 6: FINISHED is pass-through. The model can emit closing
+        markdown fences or trailing whitespace after the JSON body
+        completes; the bitmask no longer forces EOS. The model's natural
+        training (chat-template + system prompt) is responsible for
+        stopping at the right place."""
         proc = self._make()
         proc(mx.array([5], dtype=mx.int32), self._logits())
         # Saturate the {3} quantifier with three 'a's.
@@ -779,22 +810,36 @@ class TestToolAwareProcessor(unittest.TestCase):
         proc(mx.array([5, 0, 0], dtype=mx.int32), self._logits())
         proc(mx.array([5, 0, 0, 0], dtype=mx.int32), self._logits())
         self.assertEqual(proc.phase, _PHASE_FINISHED)
-        out = proc(mx.array([5, 0, 0, 0], dtype=mx.int32), self._logits())
-        row = out.tolist()[0]
-        # EOS (id 4) must be allowed; everything else masked.
-        self.assertEqual(row[4], 0.0)
-        for forbidden in (0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11):
-            self.assertEqual(row[forbidden], float("-inf"))
+        # Pass-through: logits returned unchanged.
+        logits = mx.arange(self.tokenizer.vocab_size, dtype=mx.float32)[None]
+        out = proc(mx.array([5, 0, 0, 0], dtype=mx.int32), logits)
+        self.assertEqual(out.tolist(), logits.tolist())
 
     # --- constructor validation ------------------------------------------
 
-    def test_empty_open_seq_rejected(self):
+    def test_both_delimiters_empty_rejected(self):
+        """Patch 5 makes both tool and think delimiters optional, but at
+        least one must be provided. Callers with neither should use
+        JSONLogitsProcessor directly."""
         with self.assertRaises(ValueError):
             ToolAwareJSONLogitsProcessor(
                 {"type": "object", "properties": {"x": {"type": "integer"}}},
                 _JSONFriendlyTokenizer(),
                 tool_call_start_tokens=(),
+                think_start_tokens=(),
             )
+
+    def test_think_only_allowed(self):
+        """Tool-less construction is valid as of Patch 5 — exercises the
+        think-aware-only path."""
+        proc = ToolAwareJSONLogitsProcessor(
+            {"type": "object", "properties": {"x": {"type": "integer"}}},
+            _JSONFriendlyTokenizer(),
+            think_start_tokens=(60,),
+            think_end_tokens=(61,),
+        )
+        self.assertEqual(proc._open_seq, ())
+        self.assertEqual(proc._think_open_seq, (60,))
 
     def test_missing_close_seq_allowed(self):
         """A tokenizer without a tool-call end marker still constructs;
@@ -806,6 +851,231 @@ class TestToolAwareProcessor(unittest.TestCase):
         # Many body tokens later — still tool_body, never IDLE.
         proc(mx.array([5, 6, 0, 1, 2, 3, 0, 1], dtype=mx.int32), self._logits())
         self.assertEqual(proc.phase, _PHASE_TOOL_BODY)
+
+    # --- Patch 5: think phases -------------------------------------------
+
+    def test_idle_pass_through_with_all_delimiters(self):
+        """Patch 6: IDLE doesn't apply a bitmask. The model can pick any
+        of (tool_open, think_open, schema-commit ``{``, free preamble
+        text) freely. The phase machine watches for whichever commitment
+        signal arrives first."""
+        proc = self._make(
+            open_seq=(6,), close_seq=(7,), think_open_seq=(8,), think_close_seq=(9,)
+        )
+        logits = mx.arange(self.tokenizer.vocab_size, dtype=mx.float32)[None]
+        out = proc(mx.array([5], dtype=mx.int32), logits)
+        # Pass-through: every token retains its original logit.
+        self.assertEqual(out.tolist(), logits.tolist())
+
+    def test_idle_to_think_body_on_think_open(self):
+        proc = self._make(
+            open_seq=(6,), close_seq=(7,), think_open_seq=(8,), think_close_seq=(9,)
+        )
+        proc(mx.array([5], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 8], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_THINK_BODY)
+
+    def test_think_body_is_pass_through(self):
+        proc = self._make(
+            open_seq=(6,), close_seq=(7,), think_open_seq=(8,), think_close_seq=(9,)
+        )
+        proc(mx.array([5], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 8], dtype=mx.int32), self._logits())
+        # In think_body, any token is passable. Confirm by checking that
+        # a logits tensor passes through unchanged.
+        logits = mx.arange(self.tokenizer.vocab_size, dtype=mx.float32)[None]
+        out = proc(mx.array([5, 8], dtype=mx.int32), logits)
+        self.assertEqual(out.tolist(), logits.tolist())
+
+    def test_think_close_returns_to_idle(self):
+        proc = self._make(
+            open_seq=(6,), close_seq=(7,), think_open_seq=(8,), think_close_seq=(9,)
+        )
+        proc(mx.array([5], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 8], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 8, 1], dtype=mx.int32), self._logits())  # body 'b'
+        proc(mx.array([5, 8, 1, 2], dtype=mx.int32), self._logits())  # body 'c'
+        proc(mx.array([5, 8, 1, 2, 9], dtype=mx.int32), self._logits())  # close
+        self.assertEqual(proc.phase, _PHASE_IDLE)
+
+    def test_think_then_tool_then_schema_round_trip(self):
+        """Full composition: think → close → tool-call → close → schema → FINISHED."""
+        proc = self._make(
+            open_seq=(6,), close_seq=(7,), think_open_seq=(8,), think_close_seq=(9,)
+        )
+        proc(mx.array([5], dtype=mx.int32), self._logits())
+        # Think a bit
+        proc(mx.array([5, 8], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 8, 1, 2], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 8, 1, 2, 9], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_IDLE)
+        # Now tool-call
+        proc(mx.array([5, 8, 1, 2, 9, 6], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_TOOL_BODY)
+        proc(mx.array([5, 8, 1, 2, 9, 6, 3, 7], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_IDLE)
+        # Now schema
+        proc(mx.array([5, 8, 1, 2, 9, 6, 3, 7, 0], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_IN_SCHEMA)
+        proc(mx.array([5, 8, 1, 2, 9, 6, 3, 7, 0, 0], dtype=mx.int32), self._logits())
+        proc(
+            mx.array([5, 8, 1, 2, 9, 6, 3, 7, 0, 0, 0], dtype=mx.int32),
+            self._logits(),
+        )
+        self.assertEqual(proc.phase, _PHASE_FINISHED)
+
+    def test_multi_token_think_close_false_start_falls_back(self):
+        """Mirror of test_multi_token_close_false_start_falls_back, but for think."""
+        proc = self._make(
+            open_seq=(6,),
+            close_seq=(7,),
+            think_open_seq=(8,),
+            think_close_seq=(10, 11),
+        )
+        proc(mx.array([5], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 8], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 8, 10], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_THINK_CLOSE_PREFIX)
+        # Wrong next token (not 11): revert to THINK_BODY.
+        proc(mx.array([5, 8, 10, 0], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_THINK_BODY)
+
+    def test_initial_phase_detection_prompt_inside_think(self):
+        """When prompt ends inside <think>, initial phase should be
+        THINK_BODY so the Guide doesn't immediately mask reasoning tokens.
+        Mirrors Qwen3.5's chat-template auto-injection of <think>\\n."""
+        proc = self._make(
+            open_seq=(6,), close_seq=(7,), think_open_seq=(8,), think_close_seq=(9,)
+        )
+        # Prompt ends with think_open (token 8), so prompt is inside think.
+        proc(mx.array([5, 8], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_THINK_BODY)
+
+    def test_initial_phase_detection_prompt_already_closed_think(self):
+        """When prompt has matched <think>...</think>, initial phase is
+        IDLE (Qwen3.5's enable_thinking=False renders an empty closed
+        think block)."""
+        proc = self._make(
+            open_seq=(6,), close_seq=(7,), think_open_seq=(8,), think_close_seq=(9,)
+        )
+        # Prompt: <think>...</think>\n\n (mimicked as ..., 8, ..., 9, ...).
+        proc(mx.array([5, 8, 1, 9, 5], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_IDLE)
+
+    def test_initial_phase_detection_disabled_without_think_seqs(self):
+        """If the processor was constructed without think delimiters, the
+        prompt-inside-think detection is a no-op (initial phase stays
+        IDLE) regardless of which token ids appear in the prompt."""
+        proc = self._make(open_seq=(6,), close_seq=(7,))
+        proc(mx.array([5, 8], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_IDLE)
+
+    def test_think_only_construction_idle_pass_through(self):
+        """Patch 6: with think-only delimiters (no tool), IDLE is still
+        pass-through. Sampling the think_open token transitions to
+        THINK_BODY; sampling the JSON-open token transitions to
+        IN_SCHEMA. Anything else stays in IDLE."""
+        proc = self._make(
+            open_seq=(),
+            close_seq=(),
+            think_open_seq=(8,),
+            think_close_seq=(9,),
+        )
+        logits = mx.arange(self.tokenizer.vocab_size, dtype=mx.float32)[None]
+        out = proc(mx.array([5], dtype=mx.int32), logits)
+        # Pass-through.
+        self.assertEqual(out.tolist(), logits.tolist())
+        # Sampling think_open (id 8) takes us to THINK_BODY.
+        proc(mx.array([5, 8], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_THINK_BODY)
+
+    # --- Patch 6: deferred schema enforcement ----------------------------
+
+    def test_idle_stays_idle_on_free_preamble_tokens(self):
+        """Patch 6 core invariant: tokens that aren't a commitment signal
+        (tool_open / think_open / json_open) leave the phase as IDLE.
+        The model can emit arbitrary preamble — markdown fences,
+        natural-language text, leading whitespace — before deciding."""
+        proc = self._make(
+            open_seq=(6,), close_seq=(7,), think_open_seq=(8,), think_close_seq=(9,)
+        )
+        proc(mx.array([5], dtype=mx.int32), self._logits())  # prompt baseline
+        # Emit token id 1 ('b') — not a commitment signal of any kind.
+        proc(mx.array([5, 1], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_IDLE)
+        # Emit another non-signal token. Still IDLE.
+        proc(mx.array([5, 1, 2], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_IDLE)
+        # Now commit to JSON. The fake JSON-open token in this _make()
+        # is id 0 (the 'a' that opens the a{3} regex).
+        proc(mx.array([5, 1, 2, 0], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_IN_SCHEMA)
+
+    def test_finished_pass_through_allows_trailing_content(self):
+        """Patch 6: after the Guide reaches FINISHED, the wrapper goes
+        pass-through. The model can naturally emit a closing markdown
+        fence (or any trailing tokens) without being forced into EOS by
+        a final-state bitmask."""
+        proc = self._make()
+        proc(mx.array([5], dtype=mx.int32), self._logits())
+        # Saturate the {3} quantifier.
+        proc(mx.array([5, 0], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 0, 0], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 0, 0, 0], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_FINISHED)
+        # FINISHED: the model can emit ANY token (including non-EOS).
+        logits = mx.arange(self.tokenizer.vocab_size, dtype=mx.float32)[None]
+        out = proc(mx.array([5, 0, 0, 0], dtype=mx.int32), logits)
+        self.assertEqual(out.tolist(), logits.tolist())
+        # And the wrapper continues to accept further tokens without
+        # crashing — they pass through too.
+        proc(mx.array([5, 0, 0, 0, 1], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_FINISHED)
+
+    def test_idle_to_in_schema_requires_specific_json_open_token(self):
+        """Only the configured json_open_token triggers the IDLE -> IN_SCHEMA
+        transition. Other Guide-acceptable tokens (e.g. whitespace if
+        the regex allowed it) wouldn't commit the model to schema mode
+        in Patch 6's design."""
+        # Configure a custom json_open token that's different from any
+        # Guide-acceptable token for r"a{3}".
+        proc = self._make(
+            open_seq=(6,),
+            close_seq=(7,),
+            json_open_token=3,  # id 3 = 'd', not in the regex r"a{3}"
+            regex=r"a{3}",
+        )
+        proc(mx.array([5], dtype=mx.int32), self._logits())
+        # The model emits id 3 ('d'). It IS the configured json_open
+        # token, but the Guide doesn't accept it (regex is a{3}). The
+        # processor sees the token, recognizes the json_open id, tries
+        # to advance the Guide, fails to do so, and stays in IDLE.
+        proc(mx.array([5, 3], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_IDLE)
+
+    def test_full_response_with_preamble_then_schema(self):
+        """End-to-end Patch 6 scenario: model emits preamble (markdown
+        fence-like content), then ``{``, then schema body, then trailing
+        content. The wrapper should be pass-through during preamble and
+        trailing, strict during JSON body."""
+        proc = self._make()
+        proc(mx.array([5], dtype=mx.int32), self._logits())
+        # Preamble — model writes 'b' 'c' 'd' as if it were saying
+        # something like "```json".
+        proc(mx.array([5, 1], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 1, 2], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 1, 2, 3], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_IDLE)
+        # Now the JSON commit token (id 0 = 'a').
+        proc(mx.array([5, 1, 2, 3, 0], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_IN_SCHEMA)
+        # Saturate the regex.
+        proc(mx.array([5, 1, 2, 3, 0, 0], dtype=mx.int32), self._logits())
+        proc(mx.array([5, 1, 2, 3, 0, 0, 0], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_FINISHED)
+        # Trailing content — model emits 'b' (like a closing ``` fence).
+        proc(mx.array([5, 1, 2, 3, 0, 0, 0, 1], dtype=mx.int32), self._logits())
+        self.assertEqual(proc.phase, _PHASE_FINISHED)
 
 
 # ---------------------------------------------------------------------------
@@ -833,6 +1103,8 @@ class TestToolAwareWithMTP(unittest.TestCase):
         proc = ToolAwareJSONLogitsProcessor.__new__(ToolAwareJSONLogitsProcessor)
         proc._open_seq = (100,)
         proc._close_seq = (101,)
+        proc._think_open_seq = ()
+        proc._think_close_seq = ()
         proc._index = _make_index(r".{1,32}", self.tokenizer)
         from outlines_core import Guide
         from outlines_core.kernels.mlx import allocate_token_bitmask
@@ -843,6 +1115,8 @@ class TestToolAwareWithMTP(unittest.TestCase):
         proc._advanced_suffix = []
         proc._states = []
         proc._prompt_len = None
+        proc._initial_phase = _PHASE_IDLE
+        proc._json_open_token = None  # Patch 6: no JSON enforcement in this smoke test
 
         prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
         toks = []

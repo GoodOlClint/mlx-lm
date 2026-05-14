@@ -692,29 +692,49 @@ class ResponseGenerator:
     def _make_structured_processor(self, request, tokenizer):
         """Select the right structured-output processor for ``request``.
 
-        Returns ``None`` when there is no ``json_schema``. When both a
-        schema and ``tools`` are present on a tool-calling tokenizer, the
-        tool-aware wrapper is selected so the model can still emit
-        ``<tool_call>`` blocks (issue #1). Otherwise the plain
-        ``JSONLogitsProcessor`` path is used.
+        Returns ``None`` when there is no ``json_schema``. When a schema
+        is set and the tokenizer has tool-calling and/or thinking
+        support, the Patch 6 ``ToolAwareJSONLogitsProcessor`` is
+        selected — its IDLE phase is pass-through, so the model can
+        emit preamble, ``<think>`` blocks, ``<tool_call>`` blocks, or
+        commit to JSON output (via ``{``) freely. Schema enforcement
+        kicks in only on the JSON body, between ``{`` and the matching
+        ``}``. This resolves issue #4 (tool-prompt-induced empty schema
+        shell) without compromising schema correctness on the JSON
+        portion. See issue #1 and #2 for the original Patch 4 / Patch 5
+        motivation; Patch 6 supersedes both with a simpler design.
         """
         schema = request.json_schema
         if schema is None:
             return None
         tools = request.tools if request.request_type == "chat" else None
-        if (
+        tool_capable = bool(
             tools
             and tokenizer.has_tool_calling
             and tokenizer.tool_call_start_tokens
-        ):
-            return ToolAwareJSONLogitsProcessor(
-                schema,
-                tokenizer,
-                tool_call_start_tokens=tokenizer.tool_call_start_tokens,
-                tool_call_end_tokens=tokenizer.tool_call_end_tokens,
-                cache=self.processor_cache,
-            )
-        return self.processor_cache.get_processor(schema, tokenizer)
+        )
+        think_capable = bool(
+            tokenizer.has_thinking and tokenizer.think_start_tokens
+        )
+        if not (tool_capable or think_capable):
+            return self.processor_cache.get_processor(schema, tokenizer)
+        return ToolAwareJSONLogitsProcessor(
+            schema,
+            tokenizer,
+            tool_call_start_tokens=(
+                tokenizer.tool_call_start_tokens if tool_capable else None
+            ),
+            tool_call_end_tokens=(
+                tokenizer.tool_call_end_tokens if tool_capable else None
+            ),
+            think_start_tokens=(
+                tokenizer.think_start_tokens if think_capable else None
+            ),
+            think_end_tokens=(
+                tokenizer.think_end_tokens if think_capable else None
+            ),
+            cache=self.processor_cache,
+        )
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
