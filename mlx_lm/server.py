@@ -52,6 +52,18 @@ def get_system_fingerprint():
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
+def is_metal_oom_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    oom_markers = (
+        "out of memory",
+        "insufficient memory",
+        "resource exhausted",
+        "failed to allocate",
+        "metal error: command buffer execution failed due to out of memory",
+    )
+    return any(marker in message for marker in oom_markers)
+
+
 class ToolCallFormatter:
     def __init__(self, tool_parser, tools, streaming=False):
         self._idx = 0
@@ -1177,6 +1189,56 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self._set_cors_headers()
 
+    def _classify_generation_error(self, exc: Exception):
+        if is_metal_oom_error(exc):
+            return (
+                503,
+                {
+                    "message": "Metal out-of-memory during generation.",
+                    "type": "resource_exhausted_error",
+                    "code": "metal_out_of_memory",
+                },
+            )
+        return (
+            500,
+            {
+                "message": str(exc),
+                "type": "internal_server_error",
+                "code": "internal_generation_error",
+            },
+        )
+
+    def _completion_error_response(self, status_code: int, error_payload: Dict[str, str]):
+        self._set_completion_headers(status_code)
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": error_payload}).encode())
+        self.wfile.flush()
+
+    def _stream_error_response(
+        self,
+        status_code: int,
+        error_payload: Dict[str, str],
+        stream_started: bool = False,
+    ):
+        if not stream_started:
+            self._set_stream_headers(status_code)
+            self.end_headers()
+        event = {
+            "id": self.request_id,
+            "system_fingerprint": self.system_fingerprint,
+            "object": "error",
+            "model": self.requested_model,
+            "created": self.created,
+            "error": error_payload,
+        }
+        try:
+            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+            self.wfile.write("data: [DONE]\n\n".encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Client disconnected before receiving the terminal error event.
+            pass
+
     def do_OPTIONS(self):
         self._set_completion_headers(204)
         self.end_headers()
@@ -1505,18 +1567,23 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
             )
         except Exception as e:
-            self._set_completion_headers(404)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            status_code, error_payload = self._classify_generation_error(e)
+            if self.stream:
+                self._stream_error_response(
+                    status_code, error_payload, stream_started=False
+                )
+            else:
+                self._completion_error_response(status_code, error_payload)
             return
 
         # Prepare the headers
+        stream_started = False
         if self.stream:
             self._set_stream_headers(200)
             self.end_headers()
             logging.debug("Starting stream:")
+            stream_started = True
         else:
-            self._set_completion_headers(200)
             logging.debug("Starting completion:")
 
         # Tool call formatter
@@ -1627,10 +1694,23 @@ class APIHandler(BaseHTTPRequestHandler):
                     logging.debug(f"Outgoing Response: {response_debug}")
 
                 response_json = json.dumps(resp).encode()
+                # Defer the 200 status line until generation has succeeded so
+                # an OOM mid-generation can still return a classified error.
+                self._set_completion_headers(200)
+                # Send an additional Content-Length header when it is known
                 self.send_header("Content-Length", str(len(response_json)))
                 self.end_headers()
                 self.wfile.write(response_json)
                 self.wfile.flush()
+        except Exception as e:
+            status_code, error_payload = self._classify_generation_error(e)
+            if self.stream:
+                self._stream_error_response(
+                    status_code, error_payload, stream_started=stream_started
+                )
+            else:
+                self._completion_error_response(status_code, error_payload)
+            return
         finally:
             ctx.stop()
 
